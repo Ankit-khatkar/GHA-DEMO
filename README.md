@@ -28,6 +28,93 @@ Before any Phase 2 frontend work, one migration must be applied to unblock Step 
 
 **Deployment note:** This is a new column on an existing table with a NOT NULL constraint. Gudha Gorji seed data is empty of real orders at Phase 2 start, so there's no backfill problem in practice. If any test orders exist, either delete them (preferred — they're test data) or backfill via a one-off SQL statement before applying the NOT NULL constraint.
 
+### Concrete SQL (reference sketch for `004_owner_dashboard.sql`)
+
+```sql
+-- 1. Add snapshot columns (nullable first, backfill, then NOT NULL)
+ALTER TABLE public.orders
+  ADD COLUMN customer_name  text,
+  ADD COLUMN customer_phone text;
+
+-- Backfill (safe no-op on an empty table; otherwise reads authoritative values
+-- from public.users via customer_id FK)
+UPDATE public.orders o
+SET customer_name  = u.full_name,
+    customer_phone = u.phone
+FROM public.users u
+WHERE o.customer_id = u.id
+  AND (o.customer_name IS NULL OR o.customer_phone IS NULL);
+
+ALTER TABLE public.orders
+  ALTER COLUMN customer_name  SET NOT NULL,
+  ALTER COLUMN customer_phone SET NOT NULL;
+
+-- 2. Replace the existing place_order RPC — it now snapshots customer contact
+--    as part of the same atomic INSERT. SECURITY DEFINER is preserved so the
+--    function can read the caller's own row in public.users even though RLS
+--    restricts SELECT on that table.
+CREATE OR REPLACE FUNCTION public.place_order(
+  p_restaurant_id       uuid,
+  p_delivery_address    text,
+  p_special_instructions text,
+  p_items               jsonb   -- [{ menu_item_id, quantity, unit_price }, ...]
+) RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_order_id  uuid;
+  v_full_name text;
+  v_phone     text;
+BEGIN
+  -- Read the authoritative customer contact from public.users.
+  -- Never trust these values from the client.
+  SELECT full_name, phone
+    INTO v_full_name, v_phone
+  FROM public.users
+  WHERE id = auth.uid();
+
+  IF v_full_name IS NULL OR v_phone IS NULL OR length(trim(v_phone)) = 0 THEN
+    RAISE EXCEPTION 'Profile incomplete — full_name and phone are required to place an order';
+  END IF;
+
+  INSERT INTO public.orders (
+    customer_id, restaurant_id,
+    customer_name, customer_phone,
+    delivery_address, special_instructions,
+    total_amount,  -- recalculated by the total_amount trigger after INSERT; placeholder 0 is fine
+    status
+  ) VALUES (
+    auth.uid(), p_restaurant_id,
+    v_full_name, v_phone,
+    p_delivery_address, NULLIF(p_special_instructions, ''),
+    0,
+    'pending'
+  )
+  RETURNING id INTO v_order_id;
+
+  INSERT INTO public.order_items (order_id, menu_item_id, quantity, unit_price)
+  SELECT v_order_id,
+         (item->>'menu_item_id')::uuid,
+         (item->>'quantity')::int,
+         (item->>'unit_price')::numeric(10,2)
+  FROM jsonb_array_elements(p_items) AS item;
+
+  RETURN v_order_id;
+END;
+$$;
+```
+
+> This is a **reference sketch**, not the final migration file. Diff against the existing `place_order` body in `002_security.sql` before committing — signature must match Phase 1's customer checkout caller (`src/pages/checkout/Checkout.tsx`). If the current RPC's parameter names differ, keep the existing names and only add the customer-snapshot logic inside the body.
+
+### Post-migration: Supabase Dashboard Checklist
+
+Two things the migration file cannot do for you — must be toggled manually in the Supabase Dashboard, once per environment:
+
+1. **Enable Realtime on `public.orders`.** Database → Replication → Supabase Realtime → add `public.orders`. Step 3 and Step 7 both depend on Realtime `INSERT` and `UPDATE` events from this table; without this toggle, the subscriptions return immediately without ever firing a payload and the dashboard will silently appear dead. Phase 1 already enables Realtime on `orders` for the customer's `/orders/:id` page, so this may already be on — verify before Step 3. If `order_items` is also enabled, that's fine but not required (the dashboard re-fetches line items on every INSERT).
+2. **Regenerate TypeScript types** after migration 004 applies: `npx supabase gen types typescript --local > src/types/database.ts`. Then update `src/types/models.ts`'s `Order` alias to include `customer_name` and `customer_phone`. Without this, Step 3's query select list fails type-checking.
+
 ---
 
 ## Guiding Principles
@@ -47,20 +134,20 @@ Before any Phase 2 frontend work, one migration must be applied to unblock Step 
 Before the dashboard page exists, the owner's path *into* the dashboard must work: Navbar shows the right links, `<ProtectedRoute role="owner">` gates the route, and post-login redirect sends owners to `/dashboard` instead of `/`. Without this, an owner logs in and lands on the customer landing page.
 
 ### Files to Update
-- `src/components/Navbar.tsx` + `Navbar.css` — add owner-state links
-- `src/pages/login-signup/Login.tsx` — update post-login redirect to handle `owner` role
-- `src/pages/auth/AuthCallback.tsx` — same role-based redirect for OAuth + email confirmation
+- `src/components/Navbar.tsx` + `Navbar.css` — **verify only, don't rebuild.** Phase 1 Step 5 already wired the owner state (`{ to: "/dashboard", label: "Dashboard" }` in the owner link list). Smoke-test it by logging in as an owner and confirming the correct links render; no changes expected.
+- `src/pages/login-signup/Login.tsx` — update post-login redirect to send `owner` → `/dashboard` (currently falls back to `/`)
+- `src/pages/auth/AuthCallback.tsx` — same role-based redirect for OAuth + email confirmation (currently falls back to `/` for owner)
 - `src/App.tsx` — add the `/dashboard` route (placeholder for now; real content in Step 2)
 
 ### Auth-Aware Navbar (Owner State)
 
-Per the Phase 1 Step 5 matrix, the owner state is:
+Per the Phase 1 Step 5 matrix, the owner state is already wired:
 
 | Left Side | Right Side |
 |---|---|
 | Logo, Dashboard | Profile, Logout |
 
-No cart badge, no "My Orders", no "Restaurants". Owners only see what they need.
+No cart badge, no "My Orders", no "Restaurants". Owners only see what they need. If smoke-testing reveals a regression, fix it here; otherwise leave `Navbar.tsx` alone.
 
 ### Post-Login Redirect
 
@@ -95,12 +182,15 @@ The toggle is the simplest piece of owner functionality, touches only the `resta
 ### Supabase Queries
 
 ```ts
-// Fetch the owner's restaurant (UNIQUE owner_id → exactly one row)
+// Fetch the owner's restaurant. Use .maybeSingle() — .single() throws
+// PGRST116 if no row exists; .maybeSingle() returns data: null cleanly.
+// A newly signed-up owner whose restaurant row hasn't been created by admin
+// yet is a real case, not an error.
 const { data: restaurant, error } = await supabase
   .from('restaurants')
   .select('id, name, cuisine_type, address, is_open, is_active, updated_at')
   .eq('owner_id', user.id)
-  .single()
+  .maybeSingle()
 
 // Toggle is_open (optimistic update in UI; rollback on error)
 await supabase
@@ -108,6 +198,16 @@ await supabase
   .update({ is_open: !restaurant.is_open })
   .eq('id', restaurant.id)
 ```
+
+### Onboarding-Incomplete State
+
+If `.maybeSingle()` returns `null`, the dashboard renders an onboarding screen instead of the normal three sections:
+
+> **Your restaurant isn't set up yet.**
+> We're finishing your onboarding. Please contact Ankit on WhatsApp at +91 63789 39472 and he'll get your restaurant live within 24 hours.
+> [ Open WhatsApp ]
+
+Reasoning: in v1 admin creates `restaurants` rows manually via Supabase Dashboard while personally onboarding each owner. The owner's auth account may exist a few hours before their restaurant row does. A crash ("undefined is not an object") in that window would be a terrible first impression. No retry or spinner — the fix is human, not automated.
 
 ### DB Mapping
 
@@ -124,7 +224,7 @@ await supabase
 
 | Rule | Enforcement | Section |
 |---|---|---|
-| Owner cannot set `is_active = true` themselves | `restaurants_owner_update` RLS column-level restriction (or admin-only UPDATE on that column) — frontend does not even render the `is_active` control for the owner | **4.8.2** |
+| Owner cannot set `is_active = true` themselves | **Frontend only in v1** — the dashboard does not render an `is_active` control. Deployed `restaurants_owner_update` policy enforces row ownership only (no column-level restriction), so a determined owner could bypass via a direct SDK call. Trusted-owner pool (~12 hand-onboarded restaurants) makes this an accepted v1 trade-off. See [`v2_deferred_issues.md`](v2_deferred_issues.md) §1 for the v2 fix (SECURITY DEFINER `toggle_restaurant_open` RPC). | **4.8.2** + `v2_deferred_issues.md` §1 |
 | If `is_active = false`, `is_open` toggle is **disabled** with an explanatory message: *"Your restaurant isn't active yet. Please contact admin."* | Frontend | **4.1.2** |
 | Customers stop seeing the restaurant within seconds of `is_open = false` | `restaurants_customer_select` RLS filters `is_active AND is_open` on every SELECT | **4.8.2** |
 
@@ -154,14 +254,15 @@ This is the heart of the dashboard. Once the owner can see a pending order arriv
 ### Supabase Queries
 
 ```ts
-// Initial fetch of pending orders
+// Initial fetch of pending orders — customer contact comes from snapshot columns
+// on orders (added by migration 004; see Prerequisite Migration section above)
 const { data: pendingOrders } = await supabase
   .from('orders')
   .select(`
-    id, customer_id, total_amount, delivery_address,
+    id, customer_id, customer_name, customer_phone,
+    total_amount, delivery_address,
     special_instructions, created_at, expires_at, status,
-    order_items(quantity, unit_price, menu_items(name, is_veg)),
-    users:customer_id(full_name, phone)
+    order_items(quantity, unit_price, menu_items(name, is_veg))
   `)
   .eq('restaurant_id', restaurant.id)
   .eq('status', 'pending')
@@ -179,15 +280,16 @@ supabase
       filter: `restaurant_id=eq.${restaurant.id}`
     },
     async (payload) => {
-      // payload.new is the flat orders row — no joined data.
-      // Re-fetch the full order with items + customer info before appending.
+      // payload.new is the flat orders row — customer_name/customer_phone are
+      // already in the payload (plain columns, not a join). But order_items
+      // and menu_items are not, so re-fetch for the line items.
       const { data: fullOrder } = await supabase
         .from('orders')
         .select(`
-          id, customer_id, total_amount, delivery_address,
+          id, customer_id, customer_name, customer_phone,
+          total_amount, delivery_address,
           special_instructions, created_at, expires_at, status,
-          order_items(quantity, unit_price, menu_items(name, is_veg)),
-          users:customer_id(full_name, phone)
+          order_items(quantity, unit_price, menu_items(name, is_veg))
         `)
         .eq('id', payload.new.id)
         .single()
@@ -200,7 +302,7 @@ supabase
   .subscribe()
 ```
 
-> **Note:** The joined `users:customer_id(full_name, phone)` selection relies on the `users_admin_select` or a narrowly scoped owner policy. If the deployed RLS policy restricts `users` SELECT to own row + admin (**Section 4.8.1**), owners cannot read customer names/phones through a standard join. In that case, fall back to showing just the delivery address and special instructions on the card — the restaurant delivery person calls the customer via the phone number embedded on the card. Verify against **Section 4.8.1** before implementing; if blocked, add a narrow `orders_owner_customer_info_select` policy or expose a `place_order`-style `SECURITY DEFINER` view.
+> **Why snapshot columns instead of a join:** Deployed RLS policy `users_self_select` (Section 4.8.1) restricts `public.users` SELECT to own row + admin. An owner-side `users:customer_id(full_name, phone)` join returns `null` for non-admin callers. Adding a narrow "users with an order in my restaurant" policy is expressible but fragile. Migration 004 (see Prerequisite Migration section) adds `orders.customer_name` and `orders.customer_phone` and populates them via `place_order` — the simplest solution that also matches the existing `order_items.unit_price` snapshot pattern.
 
 ### DB Mapping
 
@@ -255,12 +357,19 @@ function remaining(expiresAt: string): { mm: string, ss: string, isNegative: boo
 │ 🟢 Paneer Tikka × 2        ₹220         │
 │ 🔴 Mutton Rogan Josh × 1   ₹350         │
 │                                          │
+│ 👤 Ramesh Kumar                          │ ← customer_name (snapshot)
+│ 📞 +91 63789 39472     [ Call ]          │ ← customer_phone + tel: link
 │ 📍 123, Main Market, Gudha Gorji         │ ← delivery_address
 │ 📝 Extra spicy, call when near           │ ← special_instructions (if any)
 │                                          │
 │  [  Decline  ]    [    Accept    ]       │ ← ghost btn + red filled btn
 └─────────────────────────────────────────┘
 ```
+
+**Customer contact rules:**
+- `customer_name` and `customer_phone` come from the snapshot columns on `orders` (migration 004). Never try to join `public.users` from the owner side.
+- The phone is a tappable `tel:+91XXXXXXXXXX` link — on mobile (the primary owner device), tapping opens the dialler. The "Call" button is a separate visible CTA for desktop clarity, wrapping the same `tel:` href.
+- Customer contact is **only** visible on the pending and active cards (Sections 3 & 5). History cards (Section 6) omit it — once the order is terminal, there's no operational reason to dial the customer.
 
 ### Empty State
 
@@ -278,7 +387,7 @@ Pending orders without an accept/decline action are useless. This step wires the
 
 ### Files to Update
 - `src/pages/dashboard/OwnerDashboard.tsx` — add Accept and Decline handlers
-- New component: `src/pages/dashboard/DeclineModal.tsx` + `.css`
+- New component: `src/pages/dashboard/DeclineModal.tsx` + `.css` — a portal-less dialog rendered in `OwnerDashboard`. Parent owns state: `{ declining: { orderId: string } | null }`. Decline button on a pending card sets it; modal's Cancel resets it to `null`; modal's Confirm invokes the parent-supplied `onConfirm(reason)` handler, which runs the UPDATE and then resets the state. Keep it simple — no React portal, no router-based modal.
 
 ### Supabase Calls
 
@@ -370,11 +479,14 @@ After acceptance, the owner needs to walk the order forward: `accepted → prepa
 ### Supabase Queries
 
 ```ts
-// Initial fetch — active statuses
+// Initial fetch — active statuses. Carries customer_name/customer_phone
+// forward from the snapshot so the delivery person can still dial the
+// customer during out_for_delivery.
 const { data: activeOrders } = await supabase
   .from('orders')
   .select(`
-    id, total_amount, delivery_address, special_instructions,
+    id, customer_name, customer_phone,
+    total_amount, delivery_address, special_instructions,
     created_at, status,
     order_items(quantity, menu_items(name, is_veg))
   `)
@@ -444,18 +556,20 @@ A lightweight read-only record of what the owner has done today. Not a full anal
 ### Supabase Query
 
 ```ts
-// Today's terminal orders — IST day boundary
-// Store the day boundary as a UTC timestamp at query time
-const istNow = new Date()
-const istMidnight = new Date(istNow)
-istMidnight.setHours(0, 0, 0, 0)  // Browser's local tz; acceptable for single-region v1
+// Today's terminal orders — IST day boundary.
+// v1 assumption: all owners and customers are in Gudha Gorji (single region, IST).
+// The owner device's local clock is trusted to be IST — acceptable at v1 scale.
+// If the app ever serves multiple regions, switch to an explicit IST offset
+// (Asia/Kolkata, UTC+05:30) instead of browser local.
+const dayStart = new Date()
+dayStart.setHours(0, 0, 0, 0)
 
 const { data: history } = await supabase
   .from('orders')
   .select('id, status, total_amount, created_at, decline_reason')
   .eq('restaurant_id', restaurant.id)
   .in('status', ['completed', 'declined', 'expired'])
-  .gte('created_at', istMidnight.toISOString())
+  .gte('created_at', dayStart.toISOString())
   .order('created_at', { ascending: false })
 ```
 
@@ -466,8 +580,8 @@ const { data: history } = await supabase
 | Table | `orders` |
 | Statuses | Terminal states only (**Section 4.3.2**) |
 | RLS | `orders_owner_select` (**Section 4.8.4**) |
-| Index used | `(restaurant_id, status)` and `(created_at)` (**Section 4.7.7**) |
-| Timezone | Browser local time for day boundary — acceptable for single-region v1 (all Gudha Gorji users on IST) |
+| Index used | `(restaurant_id, status)` (**Section 4.7.7**) — serves the equality on `restaurant_id` + the `IN (...)` on `status`; remaining `created_at` ordering is a cheap sort over the already-narrow result set |
+| Timezone | Browser local time for day boundary. **Explicit v1 assumption: single region (Gudha Gorji) on IST.** If v1 ever expands beyond a single timezone, switch to an explicit `Asia/Kolkata` offset instead of browser local. |
 
 ### UI Details
 
@@ -603,7 +717,7 @@ Place a pending order → dashboard shows card. Manually run the `expire-orders`
 | Owner accepts an order cron just expired | `.eq('status', 'pending')` → 0 rows → toast + re-fetch | **4.7.5** |
 | Two tabs race to accept | Second tab gets 0 rows → treated as "already handled" | **4.7.5** |
 | Owner flips `is_open = false` with pending orders outstanding | Existing pending orders remain actionable (restaurant closure doesn't cancel them); new orders cannot be placed per `orders` insert trigger | **4.7.2** |
-| Owner tries to flip `is_active` | Column-level RLS or admin-only policy rejects; frontend doesn't render the control | **4.8.2** |
+| Owner tries to flip `is_active` | Frontend doesn't render the control. DB does **not** enforce column-level restriction in v1 — trusted owner pool; tracked in [`v2_deferred_issues.md`](v2_deferred_issues.md) §1 for hardening in v2. | **4.8.2** + `v2_deferred_issues.md` §1 |
 | Realtime disconnect mid-shift | Auto-reconnect + re-fetch on `SUBSCRIBED` keeps data consistent | **Step 7** |
 | `expire-orders` cron fails to run | Orders linger as `pending` past `expires_at`. Countdown shows 0 but UI waits for UPDATE. Monitoring: watch `expire-orders` Edge Function logs in Supabase Dashboard. | **4.7.5**, Pre-prod checklist §13 |
 | Customer RLS policy leak | Customer directly queries `orders` for another restaurant → RLS returns zero rows (**Section 4.8.4**) | **4.8.4** |
@@ -614,7 +728,8 @@ Place a pending order → dashboard shows card. Manually run the `expire-orders`
 
 | Step | Files Created / Modified | DB Tables Touched |
 |---|---|---|
-| 1 | `src/components/Navbar.tsx` + `.css` (updated — owner state), `src/pages/login-signup/Login.tsx` (redirect update), `src/pages/auth/AuthCallback.tsx` (redirect update), `src/App.tsx` (add `/dashboard` route) | `users` (via `AuthContext`) |
+| 0 (prereq) | `supabase/migrations/004_owner_dashboard.sql` (new — adds `orders.customer_name`, `orders.customer_phone`; updates `place_order` RPC to snapshot them) | `orders` (schema + RPC) |
+| 1 | `src/pages/login-signup/Login.tsx` (redirect update), `src/pages/auth/AuthCallback.tsx` (redirect update), `src/App.tsx` (add `/dashboard` route). `Navbar.tsx` is **verify-only** — owner state was already wired in Phase 1 Step 5. | `users` (via `AuthContext`) |
 | 2 | `src/pages/dashboard/OwnerDashboard.tsx` + `.css` (new) | `restaurants` |
 | 3 | `src/pages/dashboard/OwnerDashboard.tsx` (extended — Pending section, Realtime INSERT, countdown) | `orders`, `order_items`, `menu_items` |
 | 4 | `src/pages/dashboard/OwnerDashboard.tsx` (extended — Accept handler), `src/pages/dashboard/DeclineModal.tsx` + `.css` (new) | `orders` |
@@ -639,10 +754,14 @@ Every DB safeguard from **Sections 4.7 and 4.8** relevant to the owner path must
 - Order placement trigger (**4.7.2**) — new orders rejected when `is_open = false` (verified from customer side)
 - Decline reason CHECK (**4.7.3**) — empty reasons rejected at DB and blocked by modal
 - Auto-expiry race guard (**4.7.5**) — Accept-after-expire affects 0 rows; UI handles gracefully
-- Indexes on `(restaurant_id, status)` and `(restaurant_id, created_at)` (**4.7.7**) — confirmed present
-- `restaurants_owner_update` (**4.8.2**) — owner can update `is_open` but not `is_active`
+- Indexes on `(restaurant_id, status)`, `(customer_id, created_at DESC)`, and `(status, expires_at) WHERE status = 'pending'` (**4.7.7**) — confirmed present
+- `restaurants_owner_update` (**4.8.2**) — owner can update rows they own. Column-level `is_active` restriction is frontend-only in v1; see [`v2_deferred_issues.md`](v2_deferred_issues.md) §1.
 - `orders_owner_update` (**4.8.4**) — owner can update only their restaurant's orders
 - Realtime INSERT + UPDATE subscriptions with `restaurant_id` filter — only owner's events arrive
+- Realtime is enabled on `public.orders` in the Supabase Dashboard (Database → Replication)
+- Migration 004 applied — `orders.customer_name` / `orders.customer_phone` populated by `place_order` RPC; owner dashboard reads these snapshot columns instead of joining `public.users`
+- TypeScript types regenerated after migration 004 (`src/types/database.ts`); `Order` alias in `src/types/models.ts` includes `customer_name` and `customer_phone`
+- Owner with no `restaurants` row sees the onboarding-incomplete screen, not a crash
 
 **Pre-production checklist (`pre_production_checklist.md` Section 4) maps 1:1 to the above.** Ticking the Phase 2 exit criteria also ticks all of Section 4 of the pre-prod checklist.
 
